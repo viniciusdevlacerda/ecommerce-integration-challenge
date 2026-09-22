@@ -25,6 +25,6 @@ COPY requirements.txt requirements-dev.txt ./
 RUN pip install --no-cache-dir -r requirements-dev.txt
 
 COPY . .
-RUN chmod +x docker/*.sh
+RUN chmod 0755 docker/*.sh
 
 EXPOSE 8000

@@ -12,11 +12,10 @@ RUN apt-get update \
  && rm -rf /var/lib/apt/lists/*
 
 COPY docker/entrypoint-airflow.sh /opt/airflow/entrypoint.sh
-RUN chmod +x /opt/airflow/entrypoint.sh
+RUN chmod 0755 /opt/airflow/entrypoint.sh
 
 USER airflow
-RUN pip install --no-cache-dir \
-      pyodbc==5.2.0 \
-      "SQLAlchemy>=1.4.36,<2.0" \
-      pydantic==2.10.4 \
-      pydantic-settings==2.7.0
+# Apenas o pyodbc: ele nao tem dependencias Python, entao nao altera as versoes
+# que a imagem oficial do Airflow ja resolveu. O pacote de DAGs usa a biblioteca
+# padrao e o SQLAlchemy que ja vem na imagem.
+RUN pip install --no-cache-dir pyodbc==5.2.0

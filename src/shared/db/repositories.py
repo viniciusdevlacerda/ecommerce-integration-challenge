@@ -72,10 +72,13 @@ class ClientRepository(_Repository):
 
 class AddressRepository(_Repository):
     def get_current_version(self, address_uid: str) -> Address | None:
+        # A coluna booleana entra direta no WHERE. O SQL Server nao tem tipo
+        # booleano nativo, entao .is_(True) seria compilado como "IS 1", que e
+        # sintaxe invalida; passando a coluna, o dialeto gera "is_current = 1".
         return self.session.scalar(
             select(Address).where(
                 Address.address_uid == address_uid,
-                Address.is_current.is_(True),
+                Address.is_current,
             )
         )
 

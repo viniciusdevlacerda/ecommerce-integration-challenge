@@ -1,529 +1,308 @@
-# Pipeline de Integração em Larga Escala — E-commerce
+# Pipeline de integração em larga escala
 
-Protótipo ponta a ponta de ingestão de webhooks, carga histórica em massa e
-integração event-driven com sistema externo, sobre **SQL Server**, **Apache
-Airflow** e **FastAPI**.
-
-> Dados 100% sintéticos, modelados no domínio de um e-commerce de
-> eletroportáteis (air fryer, liquidificador, ventilador, linha branca).
-
----
-
-## Sumário
-
-- [Como rodar](#como-rodar)
-- [O que a demo prova](#o-que-a-demo-prova)
-- [Arquitetura](#arquitetura)
-- [Parte 1 — Modelagem e migrations](#parte-1--modelagem-e-migrations)
-- [Parte 2 — Ingestão: FastAPI vs Kafka](#parte-2--ingestão-fastapi-vs-kafka)
-- [Parte 3 — Carga de 10 milhões de linhas](#parte-3--carga-de-10-milhões-de-linhas)
-- [Parte 4 — Integração event-driven](#parte-4--integração-event-driven)
-- [Concorrência, idempotência e memória: o resumo](#concorrência-idempotência-e-memória-o-resumo)
-- [Decisões que ficaram de fora](#decisões-que-ficaram-de-fora)
-
----
+Protótipo de ingestão de webhooks, carga de histórico e integração com sistema
+externo, usando FastAPI, Redis Streams, Apache Airflow e SQL Server. Todos os
+dados são sintéticos.
 
 ## Como rodar
 
-**Pré-requisitos:** Docker com **8 GB de RAM** disponíveis (o SQL Server sozinho
-reserva ~2 GB). No Apple Silicon, a imagem do SQL Server é amd64 e roda via
-Rosetta — funciona, apenas mais devagar.
+### Requisitos
+
+Docker com Compose v2 e pelo menos 8 GB de memória liberados (o SQL Server
+reserva cerca de 2 GB sozinho). As portas 1433, 6379, 8000, 8001 e 8080 precisam
+estar livres.
+
+Em Mac com Apple Silicon a imagem do SQL Server é amd64 e roda sob Rosetta.
+Funciona, mas fica mais lenta que em hardware Intel.
+
+### Subindo
 
 ```bash
-git clone <este-repositorio> && cd ecommerce-integration-challenge
+git clone https://github.com/viniciusdevlacerda/ecommerce-integration-challenge.git
+cd ecommerce-integration-challenge
+./run.sh
+```
+
+O `run.sh` faz tudo: confere se o Docker está rodando, avisa se alguma porta
+está ocupada, cria o `.env`, sobe os containers, espera as migrations
+terminarem, espera a API responder e roda a demonstração ponta a ponta. Cada
+etapa imprime o que está acontecendo, e se algo falhar o script mostra o log do
+serviço responsável em vez de deixar você procurando.
+
+A primeira execução leva de 5 a 10 minutos. As imagens precisam instalar o
+driver ODBC da Microsoft e o SQL Server demora cerca de 40 segundos para aceitar
+a primeira conexão. Nas execuções seguintes a stack sobe em segundos.
+
+Ao terminar, o script imprime os endereços dos serviços e os próximos comandos.
+
+### Outros comandos
+
+```bash
+./run.sh test      # testes unitários e de integração
+./run.sh dag       # carga de 10 milhões de linhas
+./run.sh dag 1000000   # um décimo do volume, para validar o caminho mais rápido
+./run.sh load      # teste de carga na API de ingestão
+./run.sh bench     # compara as estratégias de escrita no SQL Server
+./run.sh demo      # roda a demonstração de novo
+./run.sh status    # estado dos containers
+./run.sh logs ingest-worker
+./run.sh down      # para tudo
+./run.sh reset     # para e apaga os volumes
+```
+
+### Sem o script
+
+O `run.sh` é conveniência; nada depende dele. Os comandos equivalentes:
+
+```bash
 cp .env.example .env
 docker compose up -d --build
-```
 
-É isso. O serviço `migrate` cria o database, liga o isolamento por snapshot,
-aplica as migrations e semeia dados mínimos — e só então as aplicações sobem
-(`depends_on: service_completed_successfully`).
+docker compose ps          # migrate deve estar em Exited (0)
+docker compose logs migrate
 
-A primeira subida leva alguns minutos (build das imagens + inicialização do SQL
-Server). Acompanhe com `docker compose logs -f` e confirme que o serviço
-`migrate` terminou com `Exited (0)`:
-
-```bash
-docker compose ps
-```
-
-| Serviço | Endereço | |
-|---|---|---|
-| Webhook API | http://localhost:8000/docs | ingestão |
-| ERP fictício | http://localhost:8001/docs | destino externo |
-| Airflow | http://localhost:8080 | `admin` / `admin` |
-| SQL Server | `localhost:1433` | `sa` / senha do `.env` |
-
-### Comandos
-
-```bash
-# fluxo ponta a ponta, com relatório impresso
 docker compose exec webhook-api python -m scripts.demo
-
-# testes unitários (não exigem a stack no ar)
 docker compose run --rm --no-deps webhook-api pytest -m "not integration" -q
-
-# testes de integração (exigem a stack no ar)
 docker compose exec webhook-api pytest -m integration -q
-
-# lint e checagem de tipos
 docker compose run --rm --no-deps webhook-api sh -c "ruff check . && mypy"
-
-# carga na borda de ingestão (429 aqui é o backpressure, não erro)
 docker compose exec webhook-api python -m scripts.loadtest --total 50000 --concurrency 128
-
-# BULK INSERT vs fast_executemany vs linha a linha
+docker compose exec airflow airflow dags trigger load_order_history_bulk
 docker compose exec airflow python /opt/airflow/dags/ecommerce/benchmark.py
-
-# 3 consumidores no mesmo consumer group
 docker compose up -d --scale ingest-worker=3
-
-# a carga dos 10 milhões
-docker compose exec airflow \
-  airflow dags trigger load_order_history_bulk --conf '{"row_count": 10000000}'
-
-# versão curta, para validar o pipeline em minutos
-docker compose exec airflow \
-  airflow dags trigger load_order_history_bulk --conf '{"row_count": 1000000}'
-
-docker compose logs -f ingest-worker   # ou migrate, dispatch-worker, airflow
-docker compose down                    # derruba, mantém os volumes
-docker compose down -v                 # derruba e apaga os volumes
+docker compose down -v
 ```
 
----
+### O que a demonstração mostra
 
-## O que a demo prova
+O `scripts/demo.py` envia eventos de cliente, pedido e pagamento, reenvia
+duplicatas de propósito, espera o pedido chegar ao ERP, tenta alterar um pedido
+já fechado e muda o endereço do cliente. Cada verificação imprime o resultado.
+Duas linhas valem atenção:
 
-O script de demonstração executa um cenário real e imprime o resultado de cada verificação:
+* `tentativas até entregar` mostra o worker de saída vencendo as falhas que o ERP
+  fictício injeta (25% das chamadas, configurável em `ERP_FAILURE_RATE`);
+* `endereço DO PEDIDO` continua Joinville mesmo depois de o cliente mudar para
+  Curitiba, que é o comportamento esperado de um pedido fechado.
 
-1. **Ingestão** — webhook → Redis Stream → SQL Server.
-2. **Idempotência (camadas 1 e 2)** — o mesmo `event_id` reenviado 3x gera **um**
-   pedido.
-3. **Idempotência (camada 3)** — `event_id` **novo** com o mesmo pedido também
-   gera um só. *Este é o caso que derruba quem deduplica apenas por chave de
-   evento.*
-4. **Integração event-driven** — o pedido aprovado chega ao ERP apesar das
-   falhas injetadas, e o número de tentativas é impresso.
-5. **Imutabilidade** — um `UPDATE` retroativo no pedido fechado é **recusado
-   pelo banco**.
-6. **SCD Tipo 2** — o cliente muda de Joinville para Curitiba; o endereço passa a
-   ter 2 versões, e o pedido antigo continua apontando para a versão antiga.
+### Interfaces
 
----
-
-## Arquitetura
-
-```
-  parceiros
-     │ HTTP
-     ▼
-┌─────────────┐   XADD    ┌──────────────┐  XREADGROUP  ┌────────────────┐
-│ webhook-api │ ────────▶ │ Redis Stream │ ───────────▶ │ ingest-worker  │
-│  FastAPI    │  (lote)   │   (buffer)   │              │   xN (escalável)│
-│  202 / 429  │           └──────────────┘              └────────┬───────┘
-└─────────────┘                                                  │ mesma transação
-                                                                 ▼
-                                                   ┌──────────────────────────┐
-  ┌─────────────┐   BULK INSERT                    │       SQL Server         │
-  │   Airflow   │ ───────────────────────────────▶ │  pedido + outbox (atômico)│
-  │  10M linhas │   (volume compartilhado)         └────────────┬─────────────┘
-  └─────────────┘                                               │ poll READPAST
-                                                                ▼
-                                                     ┌──────────────────┐  POST + retry
-                                                     │ dispatch-worker  │ ────────────▶ ERP
-                                                     └──────────────────┘
-```
-
-### Estrutura do código
-
-```
-src/
-├── shared/          config · logging · domínio (enums, eventos) · db (models, UoW, repos)
-│   └── messaging/   EventPublisher (porta) · RedisStreamPublisher · consumer · dedupe
-├── webhook_api/     borda HTTP: buffer com batching, backpressure, rotas
-├── ingest_worker/   handlers (Strategy) · registry · processor idempotente
-├── dispatch_worker/ leitura da outbox (READPAST) · cliente do ERP com retry
-└── erp_mock/        ERP fictício com injeção de falhas
-migrations/          Alembic (3 revisões)
-airflow/dags/        DAG + cliente/ (catálogo, gerador, bulk loader, benchmark)
-```
-
-**Padrões aplicados e por quê**
-
-| Padrão | Onde | Por que ali |
+| Serviço | Endereço | Acesso |
 |---|---|---|
-| **Ports & Adapters** | `EventPublisher` ↔ `RedisStreamPublisher` | é o que torna "trocar Redis por Kafka" uma classe, e não um projeto |
-| **Strategy + Registry** | `EventHandler` / `HandlerRegistry` | novo tipo de webhook = nova classe; nenhum `if/elif` cresce no consumidor |
-| **Repository** | `src/shared/db/repositories.py` | handlers falam intenção de negócio, não SQL |
-| **Unit of Work** | `src/shared/db/uow.py` | torna explícito que aprovar o pedido e gravar na outbox são **uma** transação |
-| **Transactional Outbox** | `payment_handler` + `dispatch_worker` | elimina o *dual write* entre banco e HTTP |
-| **Application Factory + DI** | `create_app()`, `api/deps.py` | rota testável sem stack no ar |
-| **Strategy** | `LoadStrategy` no bulk loader | permite medir as alternativas de carga em vez de opinar sobre elas |
+| API de webhooks | http://localhost:8000/docs | |
+| ERP fictício | http://localhost:8001/docs | `GET /erp/orders` lista o que ele recebeu |
+| Airflow | http://localhost:8080 | admin / admin |
+| SQL Server | localhost:1433 | usuário `sa`, senha do `.env`, base `ecommerce_ops` |
 
-Tipagem com `mypy` (`disallow_untyped_defs`) e lint com `ruff`.
+### Quando algo falha
 
----
+| Sintoma | O que fazer |
+|---|---|
+| `migrate` sai com código diferente de 0 | `docker compose logs migrate`. Quase sempre é o SQL Server que ainda não aceitava conexão; `docker compose up -d migrate` reexecuta só ele. |
+| `port is already allocated` | Alguma das portas está ocupada. `lsof -i :1433` identifica o processo. |
+| Containers reiniciando em loop | Memória insuficiente no Docker. Suba para 8 GB. |
+| Build falha instalando `msodbcsql18` | Sem acesso a `packages.microsoft.com`. Repita com `docker compose build --no-cache`. |
+| `Login failed for user 'sa'` | A senha do `.env` mudou depois do primeiro `up` e o volume guardou a anterior. `docker compose down -v` e suba de novo. |
+| A DAG falha em `generate_and_load` | Permissão no volume compartilhado. Confira `./run.sh logs bulk-init`. |
+| `permission denied: ./run.sh` | `chmod +x run.sh`. |
 
-## Parte 1 — Modelagem e migrations
+## FastAPI ou Kafka
 
-Alembic sobre SQLAlchemy 2.0 tipado. Três revisões: schema, triggers de
-imutabilidade, tabelas analíticas.
+Escolhi a Abordagem A, FastAPI, com Redis Streams como fila atrás dela.
 
-O requisito de negócio esconde **dois problemas diferentes**, e cada um pede um
-mecanismo diferente.
+O primeiro ponto que pesou é que webhook é HTTP e Kafka não recebe HTTP. Escolher
+a Abordagem B não elimina a necessidade de uma API na frente: alguém teria que
+expor um endpoint para o parceiro chamar e produzir no tópico. Na prática isso
+seria um Kafka REST Proxy, que é uma borda com menos controle do que a que eu
+escreveria. A decisão que realmente existe é qual fila fica atrás dessa API.
 
-### Problema A: o cadastro muda ao longo do tempo
+Com a pergunta nesses termos, a API em FastAPI é onde eu quero decidir três
+coisas que o Kafka não decide por mim:
 
-`address` é **SCD Tipo 2**: cada versão do endereço é uma linha própria.
-`address_uid` identifica o endereço lógico; `address_id` identifica a versão.
-Atualizar = fechar a linha atual (`valid_to`, `is_current = 0`) e inserir outra.
+1. o contrato de entrada, validado pelo Pydantic antes de qualquer coisa tocar a
+   fila;
+2. o código de resposta quando o sistema está sobrecarregado. Devolver 429 com
+   `Retry-After` é a única forma de pedir a um parceiro externo que reduza o
+   ritmo, e isso é HTTP, não broker;
+3. o tempo de resposta. A rota responde 202 sem tocar o banco, o que mantém a
+   latência na casa dos milissegundos independentemente de quanto o SQL Server
+   está aguentando naquele momento.
 
-Um **índice único filtrado** garante no banco que existe no máximo uma versão
-vigente por endereço lógico:
+Para a fila em si, Redis Streams entrega o que o cenário pede: consumer groups
+com entrega exclusiva por mensagem, ACK explícito, `XAUTOCLAIM` para recuperar o
+que ficou pendente em um consumidor que morreu, e limite de tamanho no stream
+via `MAXLEN`. Tudo isso com uma fração do custo operacional de subir e manter um
+cluster Kafka, o que importa num protótipo que precisa subir com um comando.
+
+Kafka seria a escolha melhor em quatro situações concretas:
+
+* **Replay histórico.** Se for preciso reprocessar semanas de eventos, a retenção
+  longa do Kafka em disco é barata e a do Redis, que vive em memória, não é.
+* **Vários consumidores independentes.** Quando times diferentes consomem o mesmo
+  fluxo com offsets próprios, o ferramental do Kafka é bem mais maduro.
+* **Ordenação particionada com garantia forte.** Redis Streams é um log único;
+  particionar por chave com garantia de ordem dentro da partição é nativo no
+  Kafka.
+* **Volume acima do que um Redis single-node aguenta.** Clusterizar Redis Streams
+  é bem mais frágil do que crescer um cluster Kafka.
+
+A troca custa uma classe. A API depende de `EventPublisher`, um Protocol em
+`src/shared/messaging/ports.py` sem nenhuma dependência de infraestrutura.
+`RedisStreamPublisher` é a implementação atual; uma `KafkaEventPublisher` entraria
+no lugar sem alterar rota, buffer ou backpressure.
+
+## Concorrência
+
+O risco que o desafio aponta, travar o banco por excesso de conexões ou de locks,
+é tratado em quatro pontos.
+
+**O pool de conexões é fixo e sem overflow.** `pool_size=8` e `max_overflow=0` em
+`src/shared/db/engine.py`. Com isso o número de conexões simultâneas no SQL
+Server é uma constante que eu escolho, e não uma função do tráfego de entrada.
+Sob pico, o excedente espera no pool do lado da aplicação. Com overflow habilitado
+um pico de 1000 requisições por segundo viraria centenas de conexões no banco, que
+é exatamente o modo de falha que se quer evitar.
+
+**Leitores não bloqueiam escritores.** O bootstrap liga
+`READ_COMMITTED_SNAPSHOT` no database. Sem isso, qualquer SELECT concorrente
+espera quem está gravando na mesma linha. É uma linha de configuração que remove
+a maior parte da contenção antes de ela aparecer.
+
+**Os lotes são ordenados antes de gravar.** Deadlock em inserção concorrente
+costuma vir de ordem inversa de aquisição de lock: um worker pega a linha A e
+quer a B, outro pegou a B e quer a A. Processando cada lote em ordem estável de
+chave, essa situação não se forma. Erro 1205 ainda é tratado com retry e backoff,
+mas passa a ser exceção.
+
+**A fila de saída usa `READPAST`.** O worker que despacha para o ERP reserva
+mensagens com `UPDATE TOP (n) ... WITH (ROWLOCK, UPDLOCK, READPAST) OUTPUT
+inserted.*`, em `src/dispatch_worker/outbox_reader.py`. O `UPDLOCK` evita corrida
+entre a leitura e a marcação, e o `READPAST` faz um worker pular as linhas que
+outro já travou em vez de esperar por elas. Sem isso, cinco workers na mesma fila
+teriam a vazão de um.
+
+Do lado da entrada, o backpressure fecha o ciclo. A API mede o atraso da fila a
+cada 500 ms (medir a cada requisição transformaria a proteção em gargalo) e, acima
+do limite, responde 429 com `Retry-After` proporcional. O buffer interno também
+tem tamanho máximo; se encher, a resposta é a mesma. O stream do Redis tem
+`MAXLEN` e o servidor está com `maxmemory-policy noeviction`, ou seja, prefere
+recusar escrita a descartar evento em silêncio.
+
+## Idempotência
+
+São três barreiras independentes, em `src/ingest_worker/processor.py` e no
+schema. Cada uma cobre um caso que as outras não cobrem.
+
+**Reserva no Redis.** `SET evt:<event_id> NX EX 86400`. Se a chave já existe, o
+evento é duplicata e o processamento para ali, sem gastar uma conexão com o
+banco. Cobre o caso mais comum, que é o parceiro reenviando em poucos segundos.
+Quando o processamento falha, a reserva é liberada; sem isso, um evento que deu
+erro ficaria marcado como visto e a reentrega seria descartada em silêncio.
+
+**Chave primária em `processed_events`.** O `event_id` é gravado nessa tabela
+dentro da mesma transação do efeito de negócio. Violação de PK significa que o
+evento já foi processado. Cobre o que a primeira barreira não pega: duplicata que
+chega horas depois, Redis reiniciado, e o caso de o worker morrer entre o commit e
+o ACK no stream, o que faz a mensagem ser reentregue.
+
+**Constraints de negócio.** `UNIQUE (order_id)` em `invoices` e
+`UNIQUE (provider, provider_tx_id)` em `payment`. Essas cobrem o caso que derruba
+quem deduplica só por chave de evento: o parceiro reenviando o mesmo fato com um
+`event_id` novo. Para as duas primeiras barreiras é um evento inédito. Para o
+banco, é uma segunda fatura do mesmo pedido, e ele recusa. É o que transforma
+"evento duplicado não gera faturamento duplicado" em garantia estrutural em vez
+de promessa da aplicação.
+
+Duas decisões completam o conjunto.
+
+O ACK no Redis só acontece depois do commit no SQL Server. A entrega passa a ser
+at-least-once, e como o processamento é idempotente o efeito observável é
+exactly-once. A ordem inversa seria mais simples e perderia eventos em qualquer
+queda entre o ACK e o commit.
+
+Na aprovação do pagamento, o handler grava o pagamento, muda o pedido para
+APPROVED e insere a mensagem na outbox na mesma transação. A transição de status
+devolve falso se o pedido já estava aprovado, então um `payment.approved`
+duplicado não gera um segundo despacho para o ERP. E o `Idempotency-Key` enviado
+no POST é derivado do id da mensagem na outbox, estável entre tentativas, de modo
+que o retry não cria pedido repetido do outro lado.
+
+## A carga de 10 milhões
+
+A DAG é `load_order_history_bulk`, em `airflow/dags/load_order_history_dag.py`.
+O parâmetro `row_count` tem 10 milhões como padrão.
+
+O fluxo é: preparar a staging, planejar os chunks, gerar e carregar cada chunk em
+paralelo, consolidar na tabela fato, validar e limpar os arquivos.
+
+### Memória
+
+O gerador em `airflow/dags/ecommerce/generator.py` é um generator. Ele produz uma
+linha, o `csv.writer` escreve, a linha é descartada. O consumo de memória é o
+mesmo para mil ou para dez milhões de linhas: medi cerca de 2 MB acima da linha
+de base em ambos os casos, gerando a 110 mil linhas por segundo.
+
+O que eu evitei, e por quê:
+
+* montar uma lista com todas as linhas antes de gravar consumiria vários GB;
+* usar DataFrame como passo intermediário tem o mesmo problema, com overhead
+  adicional;
+* gerar cada campo com Faker é cerca de cinquenta vezes mais lento que sortear de
+  listas pré-construídas, sem ganho nenhum para dado sintético.
+
+O container do Airflow está com `mem_limit: 2g` no compose. Se o processo vazar
+memória, ele morre e a DAG falha. O requisito passa a ser verificado pelo
+ambiente em vez de afirmado aqui. Há também um teste unitário que quebra se o
+gerador deixar de ser preguiçoso.
+
+### Escrita
+
+Cada chunk vira um CSV em um volume compartilhado entre o container do Airflow e
+o do SQL Server. A carga é feita com:
 
 ```sql
-CREATE UNIQUE INDEX ux_address_uid_current ON address (address_uid)
-WHERE is_current = 1;
+BULK INSERT stg_order_history
+FROM '/var/opt/mssql/bulk/order_history_0000.csv'
+WITH (FORMAT = 'CSV', FIELDTERMINATOR = ',', ROWTERMINATOR = '0x0a',
+      FIRSTROW = 2, BATCHSIZE = 100000, TABLOCK, MAXERRORS = 0)
 ```
 
-> **Por que não uma temporal table (system-versioned)?**
-> Porque o pedido precisa de **integridade referencial contra a versão exata**
-> do endereço, e não se cria FK apontando para uma history table. A temporal
-> table daria auditoria de graça, mas não daria a FK — e a FK é o requisito.
-> Como a versão precisa ser referenciável, ela tem que ser linha de primeira
-> classe, com PK própria. Daí o SCD2.
-
-### Problema B: o pedido fechado não muda retroativamente
-
-Três camadas, da aplicação ao disco:
-
-1. `orders.shipping_address_id` e `billing_address_id` apontam para a **versão**
-   do endereço vigente no fechamento. O cliente se muda amanhã e a nota fiscal
-   de ontem continua contando a verdade.
-2. `order_items` guarda SKU, descrição e preço **copiados** no momento da venda.
-   Mudança de catálogo não reescreve o histórico.
-3. Um **trigger** recusa `UPDATE`/`DELETE` em colunas financeiras e de vínculo
-   quando o status já é terminal (`APPROVED`, `INVOICED`, `CANCELLED`).
-   Avançar o **status** continua permitido — é o que diferencia "imutável" de
-   "congelado". Outro trigger protege os itens.
-
-O trigger é a última linha de defesa: protege contra qualquer caminho que não
-passe pela aplicação — script ad-hoc, job legado, alguém no SSMS.
-
-### Tabelas
-
-`clients` · `address` (SCD2) · `orders` · `order_items` · `payment` ·
-`invoices` · `processed_events` (ledger de idempotência) · `outbox` ·
-`stg_order_history` (heap) · `fact_order_history` (columnstore).
-
-Na inicialização: **`READ_COMMITTED_SNAPSHOT ON`**. É a configuração mais barata
-do projeto — uma linha que faz leitores pararem de bloquear escritores. Sem
-ela, todo `SELECT` concorrente entra na fila atrás de quem está gravando.
-
----
-
-## Parte 2 — Ingestão: FastAPI vs Kafka
-
-**Escolha: Abordagem A (FastAPI), com Redis Streams como broker.**
-
-### A justificativa
-
-O argumento central é simples: **webhook é HTTP por definição, e Kafka não
-recebe HTTP.** Escolher "Kafka" para receber webhook de parceiro não elimina a
-API — apenas esconde que ela existe, porque alguém teria que colocar um Kafka
-REST Proxy na frente, que é uma borda *menos* controlável do que a minha.
-
-A decisão real, portanto, não é *FastAPI ou Kafka*. É **qual broker fica atrás
-da borda HTTP**. Posta a pergunta certa:
-
-- **A borda é FastAPI.** É onde eu controlo validação de contrato (Pydantic),
-  código de retorno de backpressure (429 + `Retry-After` — a única forma de
-  fazer um parceiro externo reduzir o ritmo) e o tempo de resposta. O caminho
-  quente **não toca no SQL Server**: se tocasse, a velocidade do banco viraria o
-  teto da API e o parceiro tomaria timeout.
-
-- **O broker é Redis Streams.** Consumer groups, ACK explícito, `XAUTOCLAIM`
-  para consumidor morto, stream capado (`MAXLEN ~`) como teto de memória.
-  Entrega o desacoplamento que o cenário pede com uma fração do footprint
-  operacional do Kafka — que, num protótipo que precisa subir com um comando,
-  custaria ~1,5 GB de RAM e mais superfície de falha.
-
-### Quando eu trocaria por Kafka
-
-Este não é um "Kafka é overkill" preguiçoso. Os pontos de corte são concretos:
-
-| Trocaria por Kafka quando… | Porque o Redis Streams não entrega |
-|---|---|
-| for preciso **replay histórico** (reprocessar semanas de eventos) | retenção fica cara na memória |
-| houver **vários consumer groups de times diferentes** sobre o mesmo fluxo | opera, mas sem as garantias e o ferramental do Kafka |
-| for preciso **ordenação particionada por chave** com garantia forte | Redis Streams é um log único |
-| o volume sustentado passar do que um **Redis single-node** aguenta | cluster de Redis Streams é bem mais frágil que cluster Kafka |
-| existir exigência de **exactly-once transacional** no broker | Redis não tem transação de produtor |
-
-E é por isso que a interface `EventPublisher` existe: a troca é escrever
-`KafkaEventPublisher` e mudar a linha de composição. A borda HTTP não muda.
-
-### Throughput sem timeout e sem estouro de memória
-
-- **Batching** — `asyncio.Queue` + flush por **500 eventos ou 5 ms**, o que vier
-  primeiro. 500 webhooks viram **um** round-trip ao Redis, e tráfego baixo não
-  paga latência esperando lote encher.
-- **Backpressure** — o lag do stream é amostrado a cada 500 ms (medir a cada
-  requisição transformaria a proteção em gargalo). Acima do limite: **429 +
-  `Retry-After`** proporcional ao atraso. A fila interna tem tamanho máximo; se
-  encher, também é 429.
-- **Teto de memória** — `MAXLEN ~` no stream e `maxmemory-policy noeviction` no
-  Redis: preferimos **recusar** escrita a descartar evento silenciosamente.
-  Perder webhook é pior que rejeitar webhook.
-- **Shutdown gracioso** — o buffer é drenado antes do processo morrer; deploy
-  não perde evento já aceito com 202.
-
-### Idempotência — três camadas, três casos diferentes
-
-| # | Onde | Pega o caso de… |
-|---|---|---|
-| 1 | Redis `SET NX EX` | duplicata **imediata** — descartada em microssegundos, sem gastar conexão com o banco |
-| 2 | PK de `processed_events` | duplicata **tardia**, ou worker que morreu **antes do ACK** e teve a mensagem reentregue |
-| 3 | `UNIQUE(order_id)` em `invoices`, `UNIQUE(provider, provider_tx_id)` em `payment` | reenvio com **`event_id` novo** |
-
-A camada 3 é a que importa de verdade para o requisito literal do enunciado —
-*"eventos duplicados não podem gerar duplicidade de faturamento"*. As camadas 1
-e 2 deduplicam **eventos**; só a 3 garante o **fato de negócio**, porque é uma
-constraint, não uma promessa da aplicação. Se um parceiro reenviar o mesmo
-pedido com identificador novo, as duas primeiras camadas não veem nada de
-errado — o banco vê.
-
-A camada 2 roda **dentro da mesma transação** do efeito de negócio: ou o evento
-é registrado como processado e o efeito é gravado, ou nada acontece.
-
-E o detalhe que costuma passar: quando o processamento falha, a reserva no
-Redis é **liberada**. Sem isso, um evento que falhou ficaria marcado como
-"visto" e o retry seria descartado — perda silenciosa de dado.
-
-### Concorrência e travas no banco
-
-- **Pool limitado, sem overflow** (8 conexões por processo). O número de
-  conexões concorrentes é uma constante que **nós escolhemos**, não uma função
-  do tráfego. Sob pico, mais carga vira mais espera no pool — não mil conexões
-  no SQL Server.
-- **`READ_COMMITTED_SNAPSHOT`** — leitores não bloqueiam escritores.
-- **Lotes ordenados por chave** antes do INSERT: elimina deadlock por ordem
-  inversa de aquisição de lock (worker A pega a linha 1 e quer a 2; worker B
-  pega a 2 e quer a 1).
-- **Transações curtas** e nada de `MERGE` em tabela quente — `MERGE` é propenso
-  a *lock escalation* e a deadlock sob concorrência.
-- **ACK só depois do commit**: entrega at-least-once; combinada com
-  idempotência, o efeito líquido é exactly-once.
-
-Escale os consumidores com `docker compose up -d --scale ingest-worker=3` —
-todos no mesmo consumer group,
-cada mensagem entregue a um só.
-
----
-
-## Parte 3 — Carga de 10 milhões de linhas
-
-DAG `load_order_history_bulk`. Parâmetro `row_count`: **default 10.000.000**, que é
-o volume que o desafio pede — o botão *Trigger* na interface do Airflow já
-carrega os 10 milhões, sem precisar passar nada.
-
-Para validar o pipeline sem esperar a carga completa, dispare com
-`--conf '{"row_count": 1000000}'`: mesmo caminho, um décimo do volume, minutos.
-
-```
-prepare_staging ─┐
-                 ├─> [generate_and_load] x N ─> load_fact ─> validate_load ─> cleanup
-plan_chunks ─────┘        (4 em paralelo)
-```
-
-### Requisito de memória
-
-`generate_and_load` usa um **generator**: produz uma linha, o `csv.writer`
-escreve, a linha é descartada. **O pico de memória é o mesmo para mil ou para
-dez milhões de linhas.**
-
-O que foi evitado, e por quê:
-- montar uma lista com todas as linhas → vários GB de RAM;
-- usar DataFrame como intermediário → idem, com overhead extra;
-- usar Faker linha a linha → ~50x mais lento que sortear de pools
-  pré-construídos, sem ganho para dado sintético.
-
-E a prova não é textual: o container do Airflow tem **`mem_limit: 2g`** no
-compose. Se o pipeline vazar memória, o container morre e a DAG falha. O
-requisito é verificado pelo ambiente, não afirmado no README.
-
-Há um teste unitário que falha se o gerador algum dia virar uma lista
-(`test_gerador_e_preguicoso_e_nao_materializa_a_base`).
-
-### Requisito de escrita
-
-**`BULK INSERT` com `TABLOCK`, lendo de um volume compartilhado** entre o worker
-do Airflow e o container do SQL Server.
-
-O ponto: **o dado não passa pelo driver Python.** Mandamos um comando e quem lê
-o arquivo é o próprio processo do banco. Inserção linha a linha seriam 10
-milhões de round-trips; aqui é um por chunk.
-
-Detalhes que somam:
-- `TABLOCK` trava a tabela inteira — contraintuitivo, mas é o que habilita
-  **minimal logging**; a staging é um heap exclusivo da carga.
-- Recovery model **SIMPLE**: o log de transações não cresce sem limite.
-- A staging é **heap sem índice nenhum**. Índice durante a carga significaria
-  reordenar a estrutura 10 milhões de vezes.
-- O **columnstore** da tabela fato é criado vazio e recebe a carga depois
-  (compressão ~10x; consulta analítica lê só as colunas necessárias).
-- `max_active_tis_per_dag = 4`: paralelismo suficiente para ganhar tempo, baixo
-  o bastante para não saturar o SQL Server.
-- Cada chunk é uma task: falha isolada, retry barato, sem refazer a carga toda.
-- O CSV é apagado assim que carregado (10M de linhas passam de 1 GB em disco), e
-  o `cleanup` roda com `trigger_rule="all_done"` — CSV órfão não enche o disco
-  nem quando algo falha.
-
-### O pipeline confere o que carregou
-
-`validate_load` falha a DAG se a contagem não bater com o esperado, se houver
-campos obrigatórios nulos, e atualiza as estatísticas. Pipeline que carrega e
-não confere não carregou — só moveu bytes.
-
-### Benchmark
-
-O script `benchmark.py` mede as três estratégias com o mesmo volume:
-
-| estratégia | observação |
-|---|---|
-| `BULK INSERT` (volume compartilhado) | referência; o dado não passa pelo Python |
-| `pyodbc fast_executemany` | alternativa sem volume compartilhado; ordens de grandeza acima do linha a linha |
-| `INSERT` linha a linha | medido com amostra reduzida — medi-lo com 10M levaria horas, que é exatamente o motivo de o enunciado desclassificá-lo |
-
-O script imprime linhas/s e a projeção para 10M, **declarando que a projeção dos
-métodos lentos é extrapolação linear**. A medição real dos 10M é a própria DAG.
-
-> Os números dependem da máquina. Em Apple Silicon, o SQL Server roda emulado
-> via Rosetta e os valores caem — vale registrar em qual ambiente foram medidos.
-
----
-
-## Parte 4 — Integração event-driven
-
-### O problema que o Outbox resolve
-
-Quando o pagamento é aprovado, duas coisas precisam acontecer: gravar no banco e
-avisar o ERP por HTTP. **Elas não são atômicas.**
-
-- commit OK + POST falhou → o ERP nunca soube do pedido;
-- POST OK + commit falhou → o ERP conhece um pedido que não existe.
-
-É o *dual write*, e nenhum retry resolve, porque o problema é a fronteira
-transacional, não a rede.
-
-**A solução é não chamar HTTP nessa hora.** O `PaymentUpdatedHandler` grava o
-pagamento, muda o pedido para `APPROVED` e insere a mensagem na `outbox` — tudo
-na **mesma transação**. Ou as três acontecem, ou nenhuma. O `dispatch-worker`
-lê a outbox depois e faz o POST com calma.
-
-### Por que a outbox e não um poll na tabela `orders`
-
-O enunciado pede um worker que "monitore os novos pedidos inseridos". A leitura
-literal seria varrer `orders WHERE status = 'APPROVED'` por timestamp ou por um
-flag `enviado`. Três motivos para não fazer assim:
-
-1. **Janela de perda.** Marcar `enviado = 1` depois do POST é um segundo commit;
-   se o processo morre entre o POST e esse commit, o pedido é reenviado — e se a
-   ordem for invertida, nunca é enviado. A outbox resolve porque a intenção de
-   enviar nasce na mesma transação do fato que a origina.
-2. **Contenção na tabela quente.** `orders` é lida e escrita pela ingestão o
-   tempo todo. Varrê-la de segundo em segundo com um worker de saída coloca dois
-   caminhos concorrentes na mesma tabela. A `outbox` é uma fila dedicada, com
-   índice filtrado só sobre o que está pendente.
-3. **Estado de entrega não é estado do pedido.** Tentativas, último erro,
-   próxima tentativa e DLQ são atributos da *entrega*, não do pedido. Guardá-los
-   em `orders` polui a tabela de negócio com detalhe de infraestrutura.
-
-O efeito observável é o mesmo que o enunciado descreve — pedido vira `APPROVED`,
-o ERP recebe o payload completo —, mas sem a janela de inconsistência.
-
-O payload completo (cliente + **endereço na versão referenciada pelo pedido** +
-itens + pagamento) é montado **no momento da aprovação** e congelado na outbox —
-o que mantém a coerência com a regra de imutabilidade da Parte 1.
-
-### Ciclo de vida de uma mensagem
-
-```
-PENDING --claim(READPAST)--> IN_FLIGHT --POST ok--> SENT
-                                  │
-                                  ├── falha temporária ──> PENDING (backoff)
-                                  └── tentativas esgotadas / 4xx ──> DLQ
-```
-
-- **`READPAST`** no poll: o `UPDATE ... OUTPUT` marca e devolve as linhas num
-  comando atômico, e workers concorrentes **pulam** as linhas travadas por
-  outro em vez de esperar. É o que permite N workers na mesma fila sem fila
-  indiana — sem ele, cinco workers teriam a vazão de um.
-- **Backoff exponencial com jitter.** O jitter não é enfeite: sem ele, todas as
-  mensagens pendentes voltam no mesmo instante e derrubam o ERP de novo assim
-  que ele levanta.
-- **`Idempotency-Key`** estável entre tentativas: reenviar nunca cria dois
-  pedidos no ERP. Damos ao ERP a mesma cortesia que esperamos dos parceiros.
-- **DLQ** com o último erro preservado: o que falhou não se perde e não trava a
-  fila dos saudáveis.
-- **Mensagens presas** em `IN_FLIGHT` por um worker que morreu no meio do POST
-  são liberadas periodicamente.
-- Distinção entre **falha temporária** (5xx, timeout → retry) e **permanente**
-  (4xx de contrato → DLQ direto; reenviar não vai melhorar).
-
-O `erp-mock` injeta falhas numa taxa configurável (`ERP_FAILURE_RATE`, default
-25%) — metade erro de servidor, metade timeout. A resiliência é
-**demonstrável**, não alegada: a demo imprime quantas tentativas foram
-necessárias.
-
----
-
-## Concorrência, idempotência e memória: o resumo
-
-Se o avaliador ler só esta seção:
-
-**Idempotência** — três camadas independentes: dedupe rápido no Redis, PK no
-ledger `processed_events` dentro da transação de negócio, e constraints
-`UNIQUE` que tornam duplicidade de faturamento **impossível no banco**, não
-apenas improvável na aplicação. ACK no stream só depois do commit.
-
-**Concorrência** — pool de conexões fixo (o tráfego não define quantas conexões
-o banco recebe), `READ_COMMITTED_SNAPSHOT` para leitores não bloquearem
-escritores, lotes ordenados para eliminar deadlock por ordem inversa,
-transações curtas, `READPAST` na fila da outbox para workers não se
-bloquearem, e backpressure explícito (429) devolvido ao parceiro quando os
-consumidores ficam para trás.
-
-**10 milhões de linhas** — generator com memória O(1), CSV em volume
-compartilhado, `BULK INSERT` com `TABLOCK` onde o dado não atravessa o driver
-Python, chunks paralelos com limite, índices depois da carga, columnstore no
-fato, e uma task de validação que falha a DAG se a contagem não bater. O
-`mem_limit: 2g` no container transforma o requisito de memória em teste.
-
----
-
-## Decisões que ficaram de fora
-
-Cortadas conscientemente — um protótipo que precisa subir com um comando paga
-caro por peça a mais:
-
-- **Temporal table no `clients`** — SCD2 já resolve o histórico. Dois mecanismos
-  de versionamento no mesmo schema seriam confusão, não profundidade.
-- **Circuit breaker** — backoff com jitter, teto de tentativas e DLQ já cobrem o
-  requisito de resiliência. Em produção com ERP real, seria a primeira adição.
-- **Table swap com `sp_rename`** — `INSERT ... SELECT` com `TABLOCK` resolve
-  neste volume.
-- **Métricas Prometheus e validação HMAC das assinaturas** — não pedidos; em
-  produção, ambos entrariam antes de qualquer outra coisa.
-- **Kafka** — pelos motivos da seção da Parte 2, com os pontos de corte
-  explicitados.
-
-## Notas de ambiente
-
-- **Apple Silicon**: `platform: linux/amd64` no serviço `mssql` (Rosetta).
-  Funciona; benchmarks ficam mais lentos que em hardware amd64 nativo.
-- O `sa` é usado por simplicidade do protótipo — `BULK INSERT` exige
-  `ADMINISTER BULK OPERATIONS`. Em produção, usuário dedicado com permissão
-  mínima.
-- O `erp-mock` guarda o que recebeu em memória: é um mock, não um sistema.
+O ganho vem de o arquivo ser lido pelo próprio processo do SQL Server. Os dados
+não atravessam o driver Python. Inserção linha a linha seriam dez milhões de
+idas e voltas de rede; aqui é uma por chunk.
+
+Três detalhes acompanham:
+
+* `TABLOCK` trava a tabela inteira, o que habilita minimal logging. A staging é
+  um heap exclusivo da carga, ninguém mais a usa durante o processo.
+* O database está em recovery model SIMPLE, então o log de transações não cresce
+  sem limite durante a carga.
+* A staging não tem índice nenhum. Manter índice durante a inserção significaria
+  reordenar a estrutura dez milhões de vezes. A tabela fato recebe um clustered
+  columnstore, criado antes da carga porque carregar em columnstore vazio é
+  rápido e a compressão fica em torno de dez vezes.
+
+Existe uma segunda estratégia implementada, `fast_executemany` do pyodbc, em
+`airflow/dags/ecommerce/bulk_loader.py`. Ela é selecionável por parâmetro da DAG
+e serve para ambientes sem volume compartilhado. É mais lenta que o BULK INSERT,
+porque os dados passam pelo driver, mas continua ordens de grandeza acima de
+inserção linha a linha.
+
+### Paralelismo e verificação
+
+O planejamento divide o volume em chunks de 500 mil linhas, o que dá 20 tasks
+mapeadas dinamicamente. `max_active_tis_per_dag = 4` limita quantas carregam ao
+mesmo tempo: paralelismo suficiente para reduzir o tempo total sem saturar o SQL
+Server nem o disco do worker. Cada chunk é uma task independente, então uma falha
+isolada é reprocessada sozinha, sem refazer a carga inteira. O CSV é apagado logo
+após a carga, e a limpeza final roda com `trigger_rule="all_done"` para não
+deixar arquivo órfão ocupando disco quando algo falha no meio.
+
+A última etapa compara a contagem da tabela fato com o volume pedido, verifica
+campos obrigatórios nulos e atualiza as estatísticas. Se a contagem não bater, a
+DAG falha.
+
+O script `benchmark.py` mede BULK INSERT, `fast_executemany` e inserção linha a
+linha com o mesmo volume e imprime linhas por segundo. A medição do método linha
+a linha usa uma amostra reduzida e o resultado é extrapolado, o que o script
+declara na saída. Medi-lo com dez milhões levaria horas, que é justamente o
+motivo de ele estar descartado.

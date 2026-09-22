@@ -173,7 +173,15 @@ services:
         condition: service_completed_successfully
       bulk-init:
         condition: service_completed_successfully
-    command: ["/opt/airflow/entrypoint.sh"]
+    # A imagem oficial prefixa "airflow" no command; passando "bash" como
+    # primeiro argumento, o entrypoint dela executa o script em vez disso.
+    command: ["bash", "/opt/airflow/entrypoint.sh"]
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://localhost:8080/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 30
+      start_period: 120s
 
 volumes:
   mssql-data:
