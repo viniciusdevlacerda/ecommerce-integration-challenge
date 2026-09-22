@@ -1,0 +1,181 @@
+name: ecommerce-integration
+
+# ---------------------------------------------------------------------------
+# Blocos reaproveitados. Toda a stack de aplicacao usa a mesma imagem e o mesmo
+# conjunto de variaveis: uma unica fonte de verdade para configuracao.
+# ---------------------------------------------------------------------------
+x-app-env: &app-env
+  MSSQL_HOST: mssql
+  MSSQL_PORT: "1433"
+  MSSQL_USER: sa
+  MSSQL_PASSWORD: ${MSSQL_SA_PASSWORD}
+  MSSQL_DB: ${MSSQL_DB}
+  REDIS_URL: redis://redis:6379/0
+  ERP_BASE_URL: http://erp-mock:8000
+  LOG_LEVEL: ${LOG_LEVEL:-INFO}
+  PYTHONPATH: /app
+
+x-app-image: &app-image
+  build:
+    context: .
+    dockerfile: docker/app.Dockerfile
+  image: ecommerce/app:1.0.0
+
+services:
+
+  # ------------------------------------------------------------------ infra
+  mssql:
+    image: mcr.microsoft.com/mssql/server:2022-latest
+    platform: linux/amd64          # imagem oficial e amd64; roda via Rosetta no Apple Silicon
+    environment:
+      ACCEPT_EULA: "Y"
+      MSSQL_SA_PASSWORD: ${MSSQL_SA_PASSWORD}
+      MSSQL_PID: Developer
+    ports: ["1433:1433"]
+    volumes:
+      - mssql-data:/var/opt/mssql
+      - bulk-data:/var/opt/mssql/bulk
+    healthcheck:
+      # Healthcheck REAL: so fica healthy quando aceita conexao e responde query.
+      test: ["CMD-SHELL", "/opt/mssql-tools18/bin/sqlcmd -S localhost -U sa -P \"$$MSSQL_SA_PASSWORD\" -C -Q 'SELECT 1' -b -o /dev/null"]
+      interval: 10s
+      timeout: 5s
+      retries: 30
+      start_period: 40s
+
+  redis:
+    image: redis:7-alpine
+    # noeviction: preferimos recusar escrita (e devolver 429 na borda) a descartar
+    # evento silenciosamente. Perder webhook e pior que rejeitar webhook.
+    command: ["redis-server", "--appendonly", "no", "--maxmemory", "512mb", "--maxmemory-policy", "noeviction"]
+    ports: ["6379:6379"]
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  # Ajusta permissao do volume compartilhado usado pelo BULK INSERT:
+  # o Airflow escreve o CSV e o processo do SQL Server precisa conseguir ler.
+  bulk-init:
+    image: alpine:3.20
+    command: ["sh", "-c", "mkdir -p /bulk && chmod 777 /bulk"]
+    volumes:
+      - bulk-data:/bulk
+    restart: "no"
+
+  # ------------------------------------------------------- bootstrap do banco
+  # Servico efemero: cria o database, liga RCSI, aplica as migrations e semeia.
+  # Todo mundo depende dele com service_completed_successfully -> nenhuma app
+  # sobe antes do schema existir.
+  migrate:
+    <<: *app-image
+    environment: *app-env
+    depends_on:
+      mssql:
+        condition: service_healthy
+    command: ["/app/docker/entrypoint-migrate.sh"]
+    restart: "no"
+
+  # ------------------------------------------------------------ aplicacao
+  webhook-api:
+    <<: *app-image
+    environment: *app-env
+    ports: ["8000:8000"]
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+      redis:
+        condition: service_healthy
+    command: ["uvicorn", "src.webhook_api.main:app", "--host", "0.0.0.0", "--port", "8000", "--workers", "2"]
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://localhost:8000/health"]
+      interval: 10s
+      timeout: 3s
+      retries: 10
+      start_period: 15s
+
+  # Escale com: docker compose up -d --scale ingest-worker=3
+  # (sem container_name e sem ports justamente para permitir isso)
+  ingest-worker:
+    <<: *app-image
+    environment: *app-env
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+      redis:
+        condition: service_healthy
+    command: ["python", "-m", "src.ingest_worker.main"]
+    restart: unless-stopped
+
+  dispatch-worker:
+    <<: *app-image
+    environment: *app-env
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+      erp-mock:
+        condition: service_started
+    command: ["python", "-m", "src.dispatch_worker.main"]
+    restart: unless-stopped
+
+  erp-mock:
+    <<: *app-image
+    environment:
+      <<: *app-env
+      ERP_FAILURE_RATE: ${ERP_FAILURE_RATE:-0.25}
+      ERP_LATENCY_MS: ${ERP_LATENCY_MS:-40}
+    ports: ["8001:8000"]
+    command: ["uvicorn", "src.erp_mock.main:app", "--host", "0.0.0.0", "--port", "8000"]
+
+  # ------------------------------------------------------------- airflow
+  airflow-postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: airflow
+      POSTGRES_PASSWORD: airflow
+      POSTGRES_DB: airflow
+    volumes:
+      - airflow-pg:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD", "pg_isready", "-U", "airflow"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  airflow:
+    build:
+      context: .
+      dockerfile: docker/airflow.Dockerfile
+    image: ecommerce/airflow:1.0.0
+    # Requisito do desafio: rodar dentro dos limites de um worker padrao.
+    # Se o pipeline vazar memoria, o container morre e a DAG falha -> o
+    # anti-OOM e provado pelo ambiente, nao afirmado no README.
+    mem_limit: 2g
+    environment:
+      <<: *app-env
+      AIRFLOW__CORE__EXECUTOR: LocalExecutor
+      AIRFLOW__DATABASE__SQL_ALCHEMY_CONN: postgresql+psycopg2://airflow:airflow@airflow-postgres/airflow
+      AIRFLOW__CORE__LOAD_EXAMPLES: "false"
+      AIRFLOW__CORE__DAGS_ARE_PAUSED_AT_CREATION: "false"
+      AIRFLOW__CORE__PARALLELISM: "8"
+      AIRFLOW__CORE__MAX_ACTIVE_TASKS_PER_DAG: "8"
+      AIRFLOW__WEBSERVER__WORKERS: "2"
+      BULK_DIR: /var/opt/mssql/bulk
+    volumes:
+      - ./airflow/dags:/opt/airflow/dags
+      - bulk-data:/var/opt/mssql/bulk
+    ports: ["8080:8080"]
+    depends_on:
+      airflow-postgres:
+        condition: service_healthy
+      migrate:
+        condition: service_completed_successfully
+      bulk-init:
+        condition: service_completed_successfully
+    command: ["/opt/airflow/entrypoint.sh"]
+
+volumes:
+  mssql-data:
+  bulk-data:
+  airflow-pg:
