@@ -64,7 +64,7 @@ def _header(title: str) -> None:
     print(f"\n{'=' * 74}\n {title}\n{'=' * 74}")
 
 
-def step_ingest() -> None:
+def step_ingest() -> bool:
     _header("1. INGESTAO  webhook -> Redis Stream -> SQL Server")
 
     address = {
@@ -114,7 +114,7 @@ def step_ingest() -> None:
     )
     response = _post([order_event])
     print(f"   POST pedido   -> HTTP {response.status_code} {response.json()}")
-    _wait(
+    persistido = _wait(
         "pedido persistido",
         "SELECT COUNT(1) FROM orders WHERE order_uid = :uid",
         1,
@@ -122,9 +122,10 @@ def step_ingest() -> None:
     )
 
     globals()["ORDER_EVENT"] = order_event
+    return persistido
 
 
-def step_idempotency() -> None:
+def step_idempotency() -> bool:
     _header("2. IDEMPOTENCIA  duplicatas nao geram pedido nem faturamento duplicado")
 
     order_event: dict[str, Any] = globals()["ORDER_EVENT"]
@@ -152,10 +153,12 @@ def step_idempotency() -> None:
     )
     print(f"\n   pedidos com esse order_uid ..... {orders}  (esperado: 1)")
     print(f"   itens do pedido ................ {items}  (esperado: 2)")
-    print(f"   {'PASSOU' if orders == 1 and items == 2 else 'FALHOU'}")
+    ok = orders == 1 and items == 2
+    print(f"   {'PASSOU' if ok else 'FALHOU'}")
+    return ok
 
 
-def step_payment_and_erp() -> None:
+def step_payment_and_erp() -> bool:
     _header("3. EVENT-DRIVEN  pagamento aprovado -> outbox -> ERP (com falhas injetadas)")
 
     payment = _event(
@@ -207,9 +210,10 @@ def step_payment_and_erp() -> None:
         print(f"   ERP confirmou .................. {len(mine)} pedido(s): "
               f"{mine[0]['erp_order_id'] if mine else '-'}")
         print(f"   taxa de falha injetada ......... {erp['failure_rate']:.0%}")
+    return sent
 
 
-def step_immutability() -> None:
+def step_immutability() -> bool:
     _header("4. IMUTABILIDADE  pedido fechado nao aceita alteracao retroativa")
 
     try:
@@ -219,13 +223,15 @@ def step_immutability() -> None:
                 {"uid": ORDER_UID},
             )
         print("   FALHOU  o UPDATE passou -- o trigger nao esta ativo")
+        return False
     except Exception as exc:
         message = str(getattr(exc, "orig", exc))
         detail = message[message.find("Pedido") :][:80] or message[:80]
         print(f"   PASSOU  banco recusou o UPDATE: {detail}")
+        return True
 
 
-def step_scd2() -> None:
+def step_scd2() -> bool:
     _header("5. SCD TIPO 2  cliente muda de endereco, pedido antigo nao muda")
 
     before = _sql(
@@ -272,18 +278,46 @@ def step_scd2() -> None:
     print(f"   versoes do endereco ............ {versions}  (esperado: 2)")
     print(f"   endereco vigente do cliente .... {current}")
     print(f"   endereco DO PEDIDO ............. {order_city}  (antes: {before})")
-    print(f"   {'PASSOU' if order_city == before and versions == 2 else 'FALHOU'}")
+    ok = order_city == before and versions == 2
+    print(f"   {'PASSOU' if ok else 'FALHOU'}")
+    return ok
+
+
+VERIFICACOES = (
+    ("Ingestao ponta a ponta", "webhook -> Redis Stream -> SQL Server"),
+    ("Idempotencia", "duplicatas nao geram pedido nem faturamento repetido"),
+    ("Integracao com o ERP", "pedido aprovado entregue apesar das falhas injetadas"),
+    ("Imutabilidade", "banco recusa alteracao retroativa em pedido fechado"),
+    ("Historico de cadastro", "endereco versiona e o pedido mantem a versao antiga"),
+)
+
+
+def _scoreboard(resultados: list[bool]) -> None:
+    print(f"\n{'=' * 74}")
+    print(" RESULTADO".center(74))
+    print("=" * 74)
+    for (titulo, detalhe), ok in zip(VERIFICACOES, resultados, strict=True):
+        marca = "PASSOU" if ok else "FALHOU"
+        print(f"\n  [{marca}]  {titulo}")
+        print(f"            {detalhe}")
+    aprovados = sum(resultados)
+    print(f"\n{'-' * 74}")
+    print(f"  {aprovados} de {len(resultados)} verificacoes passaram")
+    print(f"{'=' * 74}\n")
 
 
 def main() -> None:
     print(f"\nDEMO ponta a ponta | execucao {RUN}")
-    step_ingest()
-    step_idempotency()
-    step_payment_and_erp()
-    step_immutability()
-    step_scd2()
-    print(f"\n{'=' * 74}\n Demo concluida. Airflow: http://localhost:8080 (admin/admin)")
-    print(" Resumo do estado do banco: ./run.sh verify\n")
+    resultados = [
+        step_ingest(),
+        step_idempotency(),
+        step_payment_and_erp(),
+        step_immutability(),
+        step_scd2(),
+    ]
+    _scoreboard(resultados)
+    print(" Estado do banco:  ./run.sh verify")
+    print(" Airflow:          http://localhost:8080  (admin / admin)\n")
 
 
 if __name__ == "__main__":
