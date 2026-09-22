@@ -138,7 +138,15 @@ class Order(Base):
 
 class OrderItem(Base):
     __tablename__ = "order_items"
-    __table_args__ = (Index("ix_order_items_order", "order_id"),)
+    __table_args__ = (
+        Index("ix_order_items_order", "order_id"),
+        # O SQL Server recusa OUTPUT sem INTO quando a tabela tem trigger
+        # habilitado para a operacao, e esta tem um AFTER INSERT que protege os
+        # itens de pedido fechado. Sem desligar o implicit_returning, o
+        # SQLAlchemy usaria OUTPUT para recuperar o IDENTITY e todo INSERT
+        # falharia; desligado, ele recorre a SCOPE_IDENTITY().
+        {"implicit_returning": False},
+    )
 
     order_item_id: Mapped[int] = mapped_column(BigInteger, _pk(), primary_key=True)
     order_id: Mapped[int] = mapped_column(ForeignKey("orders.order_id"))

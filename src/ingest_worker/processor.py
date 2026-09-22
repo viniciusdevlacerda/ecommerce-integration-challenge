@@ -73,8 +73,14 @@ class EventProcessor:
             return Result(Outcome.RETRY, str(exc))
         except Exception as exc:
             self._deduplicator.release(envelope.event_id)
-            logger.exception("falha ao processar evento", extra={"event_id": envelope.event_id})
-            return Result(Outcome.RETRY, str(exc))
+            # Uma linha por falha. O traceback completo sai em DEBUG: sob
+            # reentrega, imprimi-lo a cada tentativa torna o log ilegivel.
+            logger.error(
+                "falha ao processar evento",
+                extra={"event_id": envelope.event_id, "error": _summarize(exc)},
+            )
+            logger.debug("traceback", exc_info=exc)
+            return Result(Outcome.RETRY, _summarize(exc))
 
     def _apply(self, envelope: EventEnvelope) -> Result:
         handler = self._registry.get(envelope.event_type)
@@ -112,3 +118,9 @@ class EventProcessor:
 
 def _fingerprint(envelope: EventEnvelope) -> str:
     return hashlib.sha256(envelope.model_dump_json().encode()).hexdigest()
+
+
+def _summarize(exc: Exception) -> str:
+    """Primeira linha da causa raiz, sem o SQL nem o traceback."""
+    root = getattr(exc, "orig", exc)
+    return str(root).splitlines()[0][:220]

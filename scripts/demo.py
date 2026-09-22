@@ -282,7 +282,8 @@ def main() -> None:
     step_payment_and_erp()
     step_immutability()
     step_scd2()
-    print(f"\n{'=' * 74}\n Demo concluida. Airflow: http://localhost:8080 (admin/admin)\n")
+    print(f"\n{'=' * 74}\n Demo concluida. Airflow: http://localhost:8080 (admin/admin)")
+    print(" Resumo do estado do banco: ./run.sh verify\n")
 
 
 if __name__ == "__main__":

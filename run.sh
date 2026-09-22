@@ -4,6 +4,7 @@
 #
 #   ./run.sh              sobe tudo e roda a demo
 #   ./run.sh demo         roda so a demo (stack ja no ar)
+#   ./run.sh verify       resumo do estado do banco e da fila
 #   ./run.sh test         testes unitarios e de integracao
 #   ./run.sh load         teste de carga na API de ingestao
 #   ./run.sh dag [linhas] dispara a carga em massa (padrao 10000000)
@@ -199,6 +200,11 @@ run_demo() {
     $COMPOSE exec -T webhook-api python -m scripts.demo
 }
 
+run_verify() {
+    step "Estado do sistema"
+    $COMPOSE exec -T webhook-api python -m scripts.verify
+}
+
 run_tests() {
     step "Testes unitarios"
     $COMPOSE run --rm --no-deps -T webhook-api pytest -m "not integration" -q
@@ -233,6 +239,7 @@ case "${1:-}" in
         summary
         ;;
     demo)   detect_compose; run_demo ;;
+    verify) detect_compose; run_verify ;;
     test)   detect_compose; run_tests ;;
     load)   detect_compose; run_load ;;
     dag)    detect_compose; run_dag "${2:-}" ;;
@@ -242,7 +249,7 @@ case "${1:-}" in
     down)   detect_compose; $COMPOSE down ;;
     reset)  detect_compose; $COMPOSE down -v ;;
     -h|--help|help)
-        sed -n '3,14p' "$0" | sed 's/^# \{0,1\}//'
+        sed -n '3,15p' "$0" | sed 's/^# \{0,1\}//'
         ;;
     *)
         fail "comando desconhecido: $1   (use ./run.sh --help)"

@@ -4,18 +4,19 @@ Protótipo de ingestão de webhooks, carga de histórico e integração com sist
 externo, usando FastAPI, Redis Streams, Apache Airflow e SQL Server. Todos os
 dados são sintéticos.
 
+## Sumário
+
+- [Como rodar](#como-rodar)
+- [Como testar](#como-testar)
+- [FastAPI ou Kafka](#fastapi-ou-kafka)
+- [Concorrência](#concorrência)
+- [Idempotência](#idempotência)
+- [A carga de 10 milhões](#a-carga-de-10-milhões)
+
 ## Como rodar
 
-### Requisitos
-
-Docker com Compose v2 e pelo menos 8 GB de memória liberados (o SQL Server
-reserva cerca de 2 GB sozinho). As portas 1433, 6379, 8000, 8001 e 8080 precisam
-estar livres.
-
-Em Mac com Apple Silicon a imagem do SQL Server é amd64 e roda sob Rosetta.
-Funciona, mas fica mais lenta que em hardware Intel.
-
-### Subindo
+Requisitos: Docker com Compose v2, 8 GB de memória liberados (o SQL Server
+reserva cerca de 2 GB sozinho) e as portas 1433, 6379, 8000, 8001 e 8080 livres.
 
 ```bash
 git clone https://github.com/viniciusdevlacerda/ecommerce-integration-challenge.git
@@ -23,68 +24,23 @@ cd ecommerce-integration-challenge
 ./run.sh
 ```
 
-O `run.sh` faz tudo: confere se o Docker está rodando, avisa se alguma porta
-está ocupada, cria o `.env`, sobe os containers, espera as migrations
-terminarem, espera a API responder e roda a demonstração ponta a ponta. Cada
-etapa imprime o que está acontecendo, e se algo falhar o script mostra o log do
-serviço responsável em vez de deixar você procurando.
+O `run.sh` verifica o ambiente, cria o `.env`, sobe os containers, espera as
+migrations e a API, e roda a demonstração. Se algo falhar, ele mostra o log do
+serviço responsável. O equivalente sem o script é `cp .env.example .env` seguido
+de `docker compose up -d --build`.
 
-A primeira execução leva de 5 a 10 minutos. As imagens precisam instalar o
-driver ODBC da Microsoft e o SQL Server demora cerca de 40 segundos para aceitar
-a primeira conexão. Nas execuções seguintes a stack sobe em segundos.
+O serviço `migrate` cria o database, habilita `READ_COMMITTED_SNAPSHOT`, aplica
+as migrations do Alembic e insere alguns registros. Os demais serviços só sobem
+depois que ele termina, porque declaram
+`depends_on: migrate: service_completed_successfully`.
 
-Ao terminar, o script imprime os endereços dos serviços e os próximos comandos.
+A primeira execução leva de 5 a 10 minutos: as imagens instalam o driver ODBC da
+Microsoft e o SQL Server demora cerca de 40 segundos para aceitar a primeira
+conexão. Depois disso a stack sobe em segundos.
 
-### Outros comandos
-
-```bash
-./run.sh test      # testes unitários e de integração
-./run.sh dag       # carga de 10 milhões de linhas
-./run.sh dag 1000000   # um décimo do volume, para validar o caminho mais rápido
-./run.sh load      # teste de carga na API de ingestão
-./run.sh bench     # compara as estratégias de escrita no SQL Server
-./run.sh demo      # roda a demonstração de novo
-./run.sh status    # estado dos containers
-./run.sh logs ingest-worker
-./run.sh down      # para tudo
-./run.sh reset     # para e apaga os volumes
-```
-
-### Sem o script
-
-O `run.sh` é conveniência; nada depende dele. Os comandos equivalentes:
-
-```bash
-cp .env.example .env
-docker compose up -d --build
-
-docker compose ps          # migrate deve estar em Exited (0)
-docker compose logs migrate
-
-docker compose exec webhook-api python -m scripts.demo
-docker compose run --rm --no-deps webhook-api pytest -m "not integration" -q
-docker compose exec webhook-api pytest -m integration -q
-docker compose run --rm --no-deps webhook-api sh -c "ruff check . && mypy"
-docker compose exec webhook-api python -m scripts.loadtest --total 50000 --concurrency 128
-docker compose exec airflow airflow dags trigger load_order_history_bulk
-docker compose exec airflow python /opt/airflow/dags/ecommerce/benchmark.py
-docker compose up -d --scale ingest-worker=3
-docker compose down -v
-```
-
-### O que a demonstração mostra
-
-O `scripts/demo.py` envia eventos de cliente, pedido e pagamento, reenvia
-duplicatas de propósito, espera o pedido chegar ao ERP, tenta alterar um pedido
-já fechado e muda o endereço do cliente. Cada verificação imprime o resultado.
-Duas linhas valem atenção:
-
-* `tentativas até entregar` mostra o worker de saída vencendo as falhas que o ERP
-  fictício injeta (25% das chamadas, configurável em `ERP_FAILURE_RATE`);
-* `endereço DO PEDIDO` continua Joinville mesmo depois de o cliente mudar para
-  Curitiba, que é o comportamento esperado de um pedido fechado.
-
-### Interfaces
+Para conferir, `docker compose ps` deve mostrar o `migrate` em `Exited (0)` e os
+outros em `running` ou `healthy`. Se ele sair com outro código,
+`docker compose logs migrate` mostra o motivo.
 
 | Serviço | Endereço | Acesso |
 |---|---|---|
@@ -93,17 +49,37 @@ Duas linhas valem atenção:
 | Airflow | http://localhost:8080 | admin / admin |
 | SQL Server | localhost:1433 | usuário `sa`, senha do `.env`, base `ecommerce_ops` |
 
-### Quando algo falha
+## Como testar
 
-| Sintoma | O que fazer |
-|---|---|
-| `migrate` sai com código diferente de 0 | `docker compose logs migrate`. Quase sempre é o SQL Server que ainda não aceitava conexão; `docker compose up -d migrate` reexecuta só ele. |
-| `port is already allocated` | Alguma das portas está ocupada. `lsof -i :1433` identifica o processo. |
-| Containers reiniciando em loop | Memória insuficiente no Docker. Suba para 8 GB. |
-| Build falha instalando `msodbcsql18` | Sem acesso a `packages.microsoft.com`. Repita com `docker compose build --no-cache`. |
-| `Login failed for user 'sa'` | A senha do `.env` mudou depois do primeiro `up` e o volume guardou a anterior. `docker compose down -v` e suba de novo. |
-| A DAG falha em `generate_and_load` | Permissão no volume compartilhado. Confira `./run.sh logs bulk-init`. |
-| `permission denied: ./run.sh` | `chmod +x run.sh`. |
+```bash
+./run.sh demo      # fluxo ponta a ponta
+./run.sh verify    # resumo do estado do banco e da fila
+./run.sh test      # testes unitários e de integração
+./run.sh load      # carga na API de ingestão
+./run.sh dag       # carga de 10 milhões de linhas
+./run.sh bench     # compara as estratégias de escrita no SQL Server
+./run.sh logs ingest-worker
+./run.sh down
+```
+
+A demonstração envia eventos de cliente, pedido e pagamento, reenvia duplicatas
+de propósito, espera o pedido chegar ao ERP, tenta alterar um pedido já fechado e
+muda o endereço do cliente. Cada verificação imprime o resultado. Duas linhas
+valem atenção: `tentativas até entregar`, que mostra o worker de saída vencendo
+as falhas que o ERP fictício injeta (25% das chamadas, configurável em
+`ERP_FAILURE_RATE`), e `endereço DO PEDIDO`, que continua Joinville mesmo depois
+de o cliente mudar para Curitiba.
+
+O `verify` imprime as contagens por tabela, quantos endereços já foram
+versionados, o estado da outbox e as verificações de duplicidade, que devem estar
+todas em zero.
+
+No teste de carga, respostas 429 são esperadas: indicam o backpressure atuando,
+não falha.
+
+A carga em massa também pode ser disparada pelo botão *Trigger* na interface do
+Airflow, na DAG `load_order_history_bulk`, já com os 10 milhões. Para validar o
+caminho mais rápido, `./run.sh dag 1000000`.
 
 ## FastAPI ou Kafka
 
